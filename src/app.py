@@ -1,216 +1,16 @@
-import base64
 import html as _html
-import json
 import os
-import uuid
-import zlib
 import streamlit as st
 import time
 import state
 import datetime
-
+import re
 from typing import Dict, List, Optional
 from core import generate_diagram
 from messages import create_message_from_bytes
-
-
-def _sanitize_mermaid(code: str) -> str:
-    """
-    Remove Markdown code fences if present and return the raw Mermaid definition.
-    """
-    if not code:
-        return ""
-    text = code.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        # Drop the opening fence (e.g., ``` or ```mermaid)
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        # Drop the closing fence if present
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-    return text
-
-
-def _render_mermaid(code: str, *, height: int = 500):
-    """
-    Render Mermaid code using an embedded HTML component.
-    """
-    if not code:
-        st.info("No diagram to render yet. Generate or enter Mermaid text.")
-        return
-
-    escaped = _html.escape(code)
-    html_doc = f"""
-<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset=\"utf-8\" />
-    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-    <style>
-      html, body {{ margin: 0; padding: 0; }}
-      .mermaid {{ margin: 0; }}
-    </style>
-  </head>
-  <body>
-    <div class=\"mermaid\">{escaped}</div>
-    <script src=\"https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js\"></script>
-    <script>
-      try {{
-        // Try to follow Streamlit theme when possible
-        const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-        mermaid.initialize({{ startOnLoad: true, theme: prefersDark ? 'dark' : 'default' }});
-      }} catch (e) {{ console.error(e); }}
-    </script>
-  </body>
-</html>
-"""
-    st.components.v1.html(html_doc, height=height, scrolling=True)
-
-
-def _mermaid_live_url(code: str) -> str:
-    if not code:
-        return ""
-    code = _sanitize_mermaid(code)
-    code_json = json.dumps({"code": code})
-    compressed = zlib.compress(code_json.encode("utf-8"), level=9)
-    encoded = base64.urlsafe_b64encode(compressed).decode("ascii").rstrip("=")
-    return f"https://mermaid.live/edit#pako:{encoded}"
-
-
-def _copy_button(text: str, *, label: str, key: Optional[str] = None) -> None:
-    if not text:
-        return
-
-    button_id = key or f"copy-btn-{uuid.uuid4().hex}"
-    escaped_label = _html.escape(label)
-    json_text = json.dumps(text)
-    component_html = f"""
-<div style=\"display:flex;gap:0.5rem;align-items:center;\">
-  <button id=\"{button_id}\" style=\"padding:0.25rem 0.65rem;border:1px solid #6c757d;border-radius:4px;background:transparent;cursor:pointer;\">{escaped_label}</button>
-  <span id=\"{button_id}-status\" style=\"font-size:0.85rem;color:#6c757d;\"></span>
-</div>
-<script>
-(function() {{
-  const btn = document.getElementById('{button_id}');
-  const status = document.getElementById('{button_id}-status');
-  if (!btn) {{ return; }}
-  btn.addEventListener('click', async () => {{
-    if (!navigator.clipboard || !navigator.clipboard.writeText) {{
-      if (status) {{
-        status.textContent = 'Clipboard unavailable';
-        status.style.color = '#dc3545';
-      }}
-      return;
-    }}
-    try {{
-      await navigator.clipboard.writeText({json_text});
-      if (status) {{
-        status.textContent = 'Copied!';
-        status.style.color = '#198754';
-        setTimeout(() => {{ status.textContent = ''; }}, 2000);
-      }}
-    }} catch (err) {{
-      console.error(err);
-      if (status) {{
-        status.textContent = 'Copy failed';
-        status.style.color = '#dc3545';
-      }}
-    }}
-  }});
-}})();
-</script>
-"""
-    st.components.v1.html(component_html, height=60)
-
-
-def _download_mermaid_svg(code: str):
-    download_button_html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-    <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
-    </head>
-    <body>
-        <button id="download-svg-btn" style="padding: 10px 20px; font-size: 16px; cursor: pointer;">
-            Download SVG
-        </button>
-
-        <script>
-            // Must initialize mermaid to use the render function
-            mermaid.initialize({{ startOnLoad: false }});
-
-            document.getElementById('download-svg-btn').addEventListener('click', async function() {{
-                // The mermaid code is passed from Python into this JS block
-                const mermaidCode = `{code}`;
-
-                try {{
-                    const {{ svg }} = await mermaid.render('headless-diagram', mermaidCode);
-
-                    // Create a Blob and trigger the download
-                    const blob = new Blob([svg], {{ type: 'image/svg+xml;charset=utf-8' }});
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = 'diagram_{int(time.time())}.svg';
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    URL.revokeObjectURL(url);
-
-                }} catch (e) {{
-                    console.error("Error rendering Mermaid diagram:", e);
-                    alert("Could not render the Mermaid diagram. Check the console for errors and ensure the syntax is correct.");
-                }}
-            }});
-        </script>
-    </body>
-    </html>
-    """
-
-    st.components.v1.html(download_button_html, height=500, scrolling=True)
-
-
-def diagram_viewer():
-    viewer, editor, export = st.tabs(["Viewer", "Editor", "Export"])
-    code = st.session_state["current"].diagram_text
-    with viewer:
-        code = _sanitize_mermaid(code)
-        _render_mermaid(code, height=520)
-    with editor:
-        if code:
-            _copy_button(code, label="Copy to clipboard", key="clipboard-mermaid")
-
-        st.text_area(
-            "Mermaid definition (editable)",
-            value=code,
-            height=360,
-            key="diagram_text",
-        )
-    with export:
-        mermaid_live, drawio, svg = st.tabs(["mermaid.live", "draw.io", "svg"])
-        has_code = bool(code)
-
-        with mermaid_live:
-            if not has_code:
-                st.info("Generate a diagram to open it in mermaid.live.")
-            else:
-                mermaid_live_url = _mermaid_live_url(code)
-                st.link_button("Open in mermaid.live", mermaid_live_url)
-
-        with drawio:
-            st.markdown(
-                """
-See [documentation](https://www.drawio.com/blog/mermaid-diagrams)
-### tl;dr
-1. Go to: [app.diagrams.net](https://app.diagrams.net)
-2. Arrange -> Insert -> Mermaid… (Copy mermaid text)
-"""
-            )
-        with svg:
-            _download_mermaid_svg(code)
-
+from diagram_viewer import diagram_viewer
+from preprocessing import parse_with_indices, prompt, extract_relevant_packets   
+from src.validator_first import full_validator
 
 @st.dialog("User messages", width="large")
 def show_messages(data_fnc):
@@ -227,8 +27,9 @@ def show_ai_diagram(data_fnc):
     st.code(diagram_text)
 
 
-def show_history():
-    st.subheader("History")
+
+def pipline_handler():
+    st.subheader("Diagram Content")
     chat_history = st.session_state["current"].messages
     user_messages = []
     diagrams_counter = 1
@@ -264,11 +65,7 @@ def show_history():
                 ):
                     show_ai_diagram(lambda: content)
             diagrams_counter += 1
-
-    if len(user_messages) > 0:
-        print("got dangling user messages")
-
-
+  
 def create_turn_messages(turn_text, turn_attachments):
     turn_messages: List[Dict] = []
     unsupported: list[str] = []
@@ -287,11 +84,9 @@ def create_turn_messages(turn_text, turn_attachments):
             )
 
             if msg is None:
-                unsupported.append(name)
-            else:
-                turn_messages.append(
-                    {"msg": msg, "metadata": {"type": "chat_attachment", "name": name}}
-                )
+                unsupported.append(name) # track unsupported files to inform the user
+            else:  
+                turn_messages.append(msg) # only add supported files to the messages for generation
 
     if turn_text.strip():
         turn_messages.append(
@@ -344,7 +139,6 @@ def chatbox():
         turn_text = chat_value.get("text", "")
         turn_attachments = chat_value.get("files", [])
         submitted = True
-
     if submitted:
         curr_session = st.session_state["current"]
         if not turn_text.strip() and not turn_attachments:
@@ -358,10 +152,21 @@ def chatbox():
                 curr_session.messages[-1]["msg"]["content"] = st.session_state[
                     "diagram_text"
                 ]
+            # Create placeholders for dynamic UI updates
+            progress_placeholder = st.empty()
+            status_placeholder = st.empty()
+            
+            with progress_placeholder:
+                # Initialize the progress bar at 0%
+                progress_bar = st.progress(0)
 
+            # Step 1: Preparation
+            status_placeholder.markdown("🔍 **Step 1/5:** Preprocessing - Preparing context and files...")
+            progress_bar.progress(25)
             turn_messages, unsupported = create_turn_messages(
                 turn_text, turn_attachments
             )
+            
             # Build full message list: persistent + prior conversation + this turn's files + user text
             messages: List[Dict] = []
             messages.extend(
@@ -370,35 +175,77 @@ def chatbox():
             messages.extend(to_openai_messages(turn_messages))
 
             api_key, model = model_config()
-            with st.spinner("Generating diagram…"):
-                try:
-                    diagram = generate_diagram(
+            print(f"Using model: {model} with API key: {'set' if api_key else 'not set'}")
+
+            try:                
+                # Step 2: Generation with Spinner
+                #  Wrap the core API call in a spinner for visual feedback
+                model_string = "Gemini" if model.startswith("gemini") else "ChatGPT"
+                with st.spinner(f" {model_string} is analyzing data..."):
+                    status_placeholder.markdown(f"🧠 **Step 2/5:** {model_string} is generating the diagram...")
+                    progress_bar.progress(50)
+                    
+                    response = generate_diagram(
                         messages=messages, api_key=api_key, model=model
-                    )
-                except Exception as e:
-                    st.error(f"Generation failed: {e}")
-                    time.sleep(15)
-                else:
-                    if len(turn_messages) > 0:
-                        curr_session.messages.extend(turn_messages)
+                    )            
 
-                    # Reflect skipped files info to the UI
-                    if unsupported:
-                        st.info(
-                            "Unsupported files were skipped: " + ", ".join(unsupported)
-                        )
-                    curr_session.messages.append(
-                        {
-                            "msg": {"role": "assistant", "content": diagram},
-                            "metadata": {"type": "response", "model": model},
-                        }
-                    )
-                    curr_session.diagram_text = diagram
+                    print(f"Length of response: {len(response) if response else 0}")  # Check if response is empty or None
+                progress_bar.progress(75)
+                status_placeholder.markdown("📝 **Step 3/5:** Creating Diagram...")
+
+            except Exception as e:
+                #  Clean up UI on error
+                progress_placeholder.empty()
+                status_placeholder.empty()
+                st.error(f"Generation failed: {e}")
+                time.sleep(5)
+            else:
+                # Success cleanup
+                progress_bar.progress(100)
+                status_placeholder.markdown("📝 **Step 4/5:** Creating Validation Report...")
+                progress_placeholder.empty()
+                status_placeholder.empty()
+                if len(turn_messages) > 0:
+                    curr_session.messages.extend(turn_messages)
+
+                # Save to history
+                curr_session.messages.append(
+                    {
+                        "msg": {"role": "assistant", "content": response},
+                        "metadata": {"type": "response", "model": model},
+                    }
+                )
+
+                # Extract diagram, entities, and steps from the response using regex
+                diag_match = re.search(r"<diagram>(.*?)</diagram>", response, re.DOTALL)
+                ent_match = re.search(r"<entities>(.*?)</entities>", response, re.DOTALL)
+                step_match = re.search(r"<steps>(.*?)</steps>", response, re.DOTALL)
+
+                if diag_match and ent_match:
+                    diagram_code = diag_match.group(1).strip()
+                    entities_json = ent_match.group(1).strip()
+                    steps_json = step_match.group(1).strip() if step_match else "[]"
+                    # Store with the separator for the renderer
+
+                    packets_source = []
+                    if "packets_data" in st.session_state:
+                        packets_source = st.session_state["packets_data"]
+                    elif hasattr(curr_session, "metadata") and isinstance(curr_session.metadata, dict) and "packets_data" in curr_session.metadata:
+                        packets_source = curr_session.metadata["packets_data"]
+                    # validate diagram 
+                    validation_result = full_validator(diag_match, ent_match, steps_json, api_key, model)
+                    print(f"Validation Result: {validation_result}")
+                    print(f"\033[91mEntities match: {'found' if ent_match else 'not found'}, Diagram match: {'found' if diag_match else 'not found'}, Steps match: {'found' if step_match else 'not found'}\033[0m")
+                    curr_session.diagram_text = diagram_code
+                    curr_session.entities_json = entities_json
+                    curr_session.steps_json = steps_json
                     curr_session.updated = datetime.datetime.now().timestamp()
-
-            update_state()
-            st.rerun()
-
+                    update_state()
+                    st.rerun()
+                else:
+                    st.error("Failed to extract diagram or entities from the response. Please check the model output.")
+                    st.code(response)
+                
 
 def app():
     with st.container(vertical_alignment="top"):
@@ -408,21 +255,19 @@ def app():
         chat_col, diagram_col = st.columns([0.32, 0.68], gap="small")
 
         with chat_col.container(height=600):
-            show_history()
+            pipline_handler()
 
         with diagram_col.container(height=600):
             diagram_viewer()
 
 
 def main():
-    init()
+    print("--------------------------------------------------------------------------")
+    init() # cite: app.py
 
     with st.sidebar:
         sidebar()
-
-    app()
-
-
+    app() # cite: app.py
 def sidebar():
     st.title("Auto Diagram")
     with st.popover("", icon=":material/settings:"):
@@ -443,23 +288,33 @@ def sidebar():
         )
         if gemini_api_key:
             os.environ["GEMINI_API_KEY"] = gemini_api_key
-
-        pcap_mode_box_label = "Provide full .pcap trace if unchecked only send packet summaries to reduce request tokens"
-        pcap_mode_box = st.checkbox(
-            "Full pcap trace", help=pcap_mode_box_label, value=True
+        
+        pcap_selection = st.selectbox(
+            label="Choose Analysis Depth", # This is the visible label
+            options=["Summary", "Full", "Extraction"],
+            help="Summary: Overview stats | Full: Every packet | Extraction: Filtered attack patterns",
+            index=0
         )
-        if pcap_mode_box:
+
+        # 2. Logic to update session state based on selection
+        if pcap_selection == "Extraction":
+            st.session_state["pcap_parse_mode"] = "extraction"
+        elif pcap_selection == "Full":
             st.session_state["pcap_parse_mode"] = "full"
         else:
             st.session_state["pcap_parse_mode"] = "summary"
 
+        # 3. Usage example in your app
+        st.info(f"Active Mode: **{st.session_state['pcap_parse_mode'].upper()}**")
+
         model = st.radio(
             "Choose model",
-            ["gpt-5", "gemini-2.5-flash", "gemini-2.5-pro"],
+            [ "gemini-2.5-flash", "gemini-2.5-pro", "gpt-5"],
             captions=[
-                "Open AI GPT-5 requires Open AI API Key",
                 "Gemini 2.5 Flash requires Gemini API Key (Free tier)",
                 "Gemini 2.5 Pro requires Gemini API Key",
+                "Open AI GPT-5 requires Open AI API Key",
+
             ],
         )
 
@@ -469,6 +324,15 @@ def sidebar():
         else:
             st.session_state["api_key"] = gemini_api_key
 
+        # In sidebar() function, after the model selection:
+        st.divider()
+        diagram_format = st.radio(
+            "Diagram Engine",
+            ["D2", "Mermaid"],
+            index=0,
+            help="D2 supports advanced styling and icons; Mermaid is faster for simple flows."
+        )
+        st.session_state["diagram_format"] = diagram_format
     st.header("Sessions")
     if st.button("New", icon=":material/open_in_new:", type="primary"):
         curr = state.ChatSession()
@@ -519,10 +383,20 @@ def init():
     if "current" not in st.session_state:
         st.session_state["current"] = state.ChatSession()
 
-    # Session state
+    curr = st.session_state["current"]
+    if "diagram_text" not in st.session_state:
+        st.session_state["diagram_text"] = curr.diagram_text
+    if "entities_json" not in st.session_state:
+        st.session_state["entities_json"] = curr.entities_json
+    if "steps_json" not in st.session_state:
+        st.session_state["steps_json"] = curr.steps_json
+    # ------------------------------------------
+
+    if "diagram_format" not in st.session_state:
+        st.session_state["diagram_format"] = "D2"
+
     if "pcap_parse_mode" not in st.session_state:
         st.session_state["pcap_parse_mode"] = "full"
-
 
 if __name__ == "__main__":
     main()
